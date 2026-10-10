@@ -1,0 +1,85 @@
+[project]
+name = "inferencex"
+version = "0.6.0"
+description = "Self-hosted LLM inference platform with smart routing and observability"
+requires-python = ">=3.13"
+dependencies = [
+    "vllm>=0.6.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+    "uvicorn>=0.32.0",
+    "rich>=13.0",
+    "textual>=8.2,<9",
+    "prometheus-client>=0.25.0",
+]
+
+[project.optional-dependencies]
+hardware = ["nvidia-ml-py>=12.0", "psutil>=5.9"]
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.10.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-repeat>=0.9.3",
+    "httpx2>=2.0",
+    "ruff>=0.16.1",
+    "mypy>=2.3.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette",
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
+    # SWIG bindings in torch/vllm (Python 3.13+)
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+    # WSL / CPU-only test hosts without NVML
+    "ignore:Can't initialize NVML:UserWarning",
+]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+# Deliberately small (DEC-048): the rule set the tree already passes, so that
+# landing CI required no source edits. Widening it is a separate change.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # Deliberate: api/main.py applies the vLLM platform patch before importing
+    # any vLLM-touching module, and scripts/ set sys.path before importing.
+    "E402",
+    # Pre-existing occurrences, deferred rather than endorsed. Enabling either
+    # requires editing source, which OS-1 forbids.
+    "F401",
+    "F841",
+]
+
+[tool.mypy]
+python_version = "3.13"
+
+# Third-party packages shipping no type information. Not a code-quality
+# suppression — these say nothing about inference_x's own types.
+[[tool.mypy.overrides]]
+module = ["yaml", "pynvml"]
+ignore_missing_imports = true
+
+# Type-check baseline (DEC-048). Closed, enumerated list — no wildcards, so a
+# module added later is checked by default. This list must not grow during
+# Phase A; growth is a review finding, not a routine edit.
+[[tool.mypy.overrides]]
+module = [
+    "inference_x.engines.vllm_engine",  # 8 — vLLM's AsyncLLM is untyped (5); 3 pre-existing, unrelated to B1
+    "inference_x.api.deps",             # 2  — composition-root arg types
+]
+ignore_errors = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inference_x"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(..., max_length=32_000)
+
+
+class StreamOptions(BaseModel):
+    """OpenAI-compatible `stream_options` object (DEC-049).
+
+    Only `include_usage` is supported. An absent `stream_options` is equivalent
+    to `include_usage=False`.
+    """
+
+    include_usage: bool = Field(
+        default=False,
+        description="When true, the stream emits a final chunk with an empty "
+        "choices array carrying engine-accounted usage, before data: [DONE].",
+    )
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage] = Field(..., min_length=1, max_length=50)
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=512, ge=1, le=4096)
+    top_p: Optional[float] = Field(default=0.95, ge=0.0, le=1.0)
+    stream: bool = False
+    max_context_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Prompt-token ceiling enforced pre-dispatch by AdmissionController; "
+        "None means the model's configured max_model_len is the only ceiling.",
+    )
+    max_output_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=4096,
+        description="Preferred alias for max_tokens; takes precedence over max_tokens "
+        "when both are set. Kept max_tokens for OpenAI-client compatibility.",
+    )
+    priority: Literal["interactive", "batch"] = Field(
+        default="interactive",
+        description="'interactive' requests get output clamped to fit available context/"
+        "KV budget when possible; 'batch' requests are rejected (429) instead of clamped "
+        "when the engine is saturated. Client-supplied and unauthenticated — do not treat "
+        "as a trust boundary.",
+    )
+    stream_options: Optional[StreamOptions] = Field(
+        default=None,
+        description="OpenAI-compatible streaming options. Absent means "
+        "include_usage=False — no usage chunk is emitted.",
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        description="Optional sampling seed forwarded unchanged to the live "
+        "backend sampler when set (DEC-051). Absent/null omits seed from "
+        "SamplingParams. Does not claim end-to-end determinism.",
+    )
+    strict: bool = Field(
+        default=False,
+        description="When true, a request the server would have executed with a "
+        "substituted parameter is rejected with 400 instead (DEC-052). Strict "
+        "only converts substitution into rejection — it never changes the "
+        "substitution itself, and it never rejects on degraded warnings, which "
+        "would turn admission fail-closed (DEC-047 §4).",
+    )
+
+
+class ResponseWarning(BaseModel):
+    """One thing the server did that the client did not ask for (OS-4).
+
+    `type` is the axis a client branches on, and it has exactly two members:
+
+    - `substituted` — the server ran something different from what was asked.
+      This is the set `strict` rejects on (DEC-052).
+    - `degraded` — the server could not verify something and proceeded anyway.
+      This never rejects, under either `strict` value: rejecting here would
+      convert admission's fail-open posture into fail-closed (DEC-047 §4).
+
+    `code` is the stable machine identifier — what `strict` keys on and what
+    tests assert. The closed set is registered in DEC-053. `message` is human
+    text and the only field free to change without a spec change. `field` names
+    the affected request field, or None for a gate that maps to no single field.
+    """
+
+    type: Literal["substituted", "degraded"]
+    code: str
+    message: str
+    field: Optional[str] = None
+
+
+class ResolvedRequest(BaseModel):
+    """The request the server actually executed — the Effective Request (OS-4).
+
+    Membership follows a derivability rule rather than curation: a field appears
+    here **iff** it exists on `ChatCompletionRequest`, minus `messages` (content,
+    not a parameter) and minus the transport/policy controls `stream`,
+    `stream_options` and `strict`. `tests/unit/test_schemas.py` enforces the rule,
+    so a field added to the request later forces an explicit decision here rather
+    than silently omitting itself.
+
+    It is a full echo rather than a diff: a diff needs the original to be
+    interpretable, and only a self-contained echo can be re-submitted as-is with
+    the caller's own messages.
+
+    Load-time engine and tier settings do not appear here. They are process-level
+    state, and a per-request block that reports them conflates two lifetimes. A
+    tier cap that *caused* a clamp surfaces as that clamp's warning instead.
+    """
+
+    model: str
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    top_p: Optional[float] = None
+    max_context_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    priority: Literal["interactive", "batch"] = "interactive"
+    seed: Optional[int] = None
+
+
+class ChatCompletionMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: Literal["stop", "length", "error"]
+
+
+class ChatCompletionUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class EngineTiming(BaseModel):
+    """Per-request engine-internal timing (Phase B3).
+
+    Derived exclusively from the engine's own process-clock timestamps —
+    never from a frontend wall-clock or HTTP-boundary timestamp (see
+    `expose-per-request-engine-timing` design.md, "clock domain"). This is
+    deliberately distinct from `GET /v1/metrics`'s HTTP-boundary latency/TTFT
+    and from `GET /metrics`'s process-wide Prometheus series: this block
+    answers "how was *this* request served," not "how is the engine doing."
+
+    `inference_time_ms` is `prefill_time_ms + decode_time_ms`, reported
+    directly (mirroring vLLM's own internal tracing) rather than requiring
+    the client to re-derive it.
+    """
+
+    queue_time_ms: float
+    prefill_time_ms: float
+    decode_time_ms: float
+    inference_time_ms: float
+
+
+class ChatStreamChunk(BaseModel):
+    """One event on the engine streaming channel (DEC-049).
+
+    This is the `BaseEngine.generate_stream` element type — the Engine Boundary's
+    streaming vocabulary. It deliberately lives in `schemas.chat` beside the wire
+    models: DEC-047 forbids a backend-neutral execution package, and a second
+    type system for the same information is exactly what that prohibits.
+
+    Content events set `content` and leave `finish_reason`, `usage`, and
+    `timing` None. The terminal event sets `finish_reason`, and sets `usage`
+    and `timing` when the backend can account them — an engine that cannot
+    supply per-request timing leaves `timing` None rather than estimating it
+    (Phase B3, mirroring DEC-049's usage-absence rule).
+    """
+
+    content: str = ""
+    finish_reason: Optional[Literal["stop", "length", "error"]] = None
+    usage: Optional[ChatCompletionUsage] = None
+    timing: Optional[EngineTiming] = None
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:24]}")
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[ChatCompletionChoice]
+    usage: ChatCompletionUsage
+    timing: Optional[EngineTiming] = Field(
+        default=None,
+        description="Per-request engine-internal timing (Phase B3): queue, "
+        "prefill, decode, and total inference time, sourced from the "
+        "engine's own process-clock timestamps. None when the backend "
+        "cannot supply it — never estimated.",
+    )
+    resolved: Optional[ResolvedRequest] = Field(
+        default=None,
+        description="The request the server actually executed (OS-4). Attached by "
+        "ChatService, never by an engine — the Engine Boundary does not learn "
+        "about admission. Defaults to None so direct construction keeps working; "
+        "on the service path it is always populated.",
+    )
+    warnings: list[ResponseWarning] = Field(
+        default_factory=list,
+        description="Every substitution the server made and every check it could "
+        "not perform (OS-4). Empty, never absent, when nothing was substituted.",
+    )

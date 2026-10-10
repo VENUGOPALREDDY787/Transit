@@ -1,0 +1,28 @@
+.venv/
+.idea/
+
+.env
+*.egg-info
+
+__pycache__/
+.pytest_cache/
+logs/
+
+# Machine-specific benchmark results — run make benchmark locally
+benchmarks/results/
+*.benchmark.json
+
+# Private writing — not for the public repo
+article-final.md
+
+# Graphify
+graphify-out/
+
+# Firecrawl
+.firecrawl/
+
+# token-savior local index cache (regenerable)
+.token-savior-cache.json
+.README.md
+.SECURITY.md
+
